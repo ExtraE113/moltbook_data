@@ -4,8 +4,9 @@ Moltbook Data Downloader
 
 Downloads all available data from Moltbook API:
 - Posts with comments (sorted oldest to newest)
-- Submolts (communities)
-- Agent profiles extracted from posts/comments
+- Submolts (communities) with full details
+- Agent profiles
+- All raw API responses preserved (no filtering)
 
 Data is stored as JSON files with checkpointing for resume capability.
 Uses async parallel fetching with rate limiting.
@@ -13,11 +14,8 @@ Uses async parallel fetching with rate limiting.
 
 import asyncio
 import json
-import time
-import os
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any
 from dataclasses import dataclass, field
 
 import httpx
@@ -39,24 +37,27 @@ console = Console()
 @dataclass
 class DownloadState:
     """Tracks download progress for checkpointing."""
-    posts_fetched: set[str] = field(default_factory=set)
     posts_with_details: set[str] = field(default_factory=set)
-    submolts_fetched: bool = False
-    agents: dict[str, dict] = field(default_factory=dict)
-    submolts: dict[str, dict] = field(default_factory=dict)
+    submolts_fetched: set[str] = field(default_factory=set)
+    agents_fetched: set[str] = field(default_factory=set)
+    agent_names_discovered: set[str] = field(default_factory=set)
+    submolt_names_discovered: set[str] = field(default_factory=set)
     last_checkpoint: str = ""
 
     def save(self, path: Path):
         """Save checkpoint to disk."""
         data = {
-            "posts_fetched": list(self.posts_fetched),
             "posts_with_details": list(self.posts_with_details),
-            "submolts_fetched": self.submolts_fetched,
-            "agents": self.agents,
-            "submolts": self.submolts,
+            "submolts_fetched": list(self.submolts_fetched),
+            "agents_fetched": list(self.agents_fetched),
+            "agent_names_discovered": list(self.agent_names_discovered),
+            "submolt_names_discovered": list(self.submolt_names_discovered),
             "last_checkpoint": datetime.now(timezone.utc).isoformat(),
         }
-        path.write_text(json.dumps(data, indent=2, default=str))
+        # Write atomically
+        tmp_path = path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2, default=str))
+        tmp_path.rename(path)
 
     @classmethod
     def load(cls, path: Path) -> "DownloadState":
@@ -66,11 +67,11 @@ class DownloadState:
         try:
             data = json.loads(path.read_text())
             state = cls()
-            state.posts_fetched = set(data.get("posts_fetched", []))
             state.posts_with_details = set(data.get("posts_with_details", []))
-            state.submolts_fetched = data.get("submolts_fetched", False)
-            state.agents = data.get("agents", {})
-            state.submolts = data.get("submolts", {})
+            state.submolts_fetched = set(data.get("submolts_fetched", []))
+            state.agents_fetched = set(data.get("agents_fetched", []))
+            state.agent_names_discovered = set(data.get("agent_names_discovered", []))
+            state.submolt_names_discovered = set(data.get("submolt_names_discovered", []))
             state.last_checkpoint = data.get("last_checkpoint", "")
             return state
         except (json.JSONDecodeError, KeyError) as e:
@@ -101,7 +102,7 @@ class AsyncMoltbookClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code != 404:  # Don't spam 404s
+            if e.response.status_code not in (404, 405):  # Don't spam common errors
                 console.print(f"[red]HTTP {e.response.status_code}: {endpoint}[/red]")
             return None
         except httpx.RequestError as e:
@@ -115,52 +116,44 @@ class AsyncMoltbookClient:
         await self.client.aclose()
 
 
-def extract_agent_from_author(author: dict | None, agents: dict, source_type: str, source_id: str):
-    """Extract agent information from author data."""
-    if not author or not isinstance(author, dict):
-        return
+def extract_names_from_response(data: dict, state: DownloadState):
+    """Extract agent and submolt names from any API response for later fetching."""
 
-    agent_name = author.get("name") or author.get("username")
-    agent_id = author.get("id")
+    def extract_from_author(author):
+        if author and isinstance(author, dict):
+            name = author.get("name") or author.get("username")
+            if name:
+                state.agent_names_discovered.add(name)
 
-    if not agent_name:
-        return
+    def extract_from_submolt(submolt):
+        if submolt and isinstance(submolt, dict):
+            name = submolt.get("name") or submolt.get("slug")
+            if name:
+                state.submolt_names_discovered.add(name)
 
-    if agent_name not in agents:
-        agents[agent_name] = {
-            "id": agent_id,
-            "name": agent_name,
-            "first_seen": datetime.now(timezone.utc).isoformat(),
-            "karma": author.get("karma"),
-            "follower_count": author.get("follower_count"),
-            "following_count": author.get("following_count"),
-            "post_ids": [],
-            "comment_ids": [],
-        }
+    def extract_from_comments(comments):
+        for comment in comments or []:
+            extract_from_author(comment.get("author"))
+            extract_from_comments(comment.get("replies", []))
 
-    # Update with any new info
-    if author.get("karma") is not None:
-        agents[agent_name]["karma"] = author.get("karma")
-    if author.get("follower_count") is not None:
-        agents[agent_name]["follower_count"] = author.get("follower_count")
+    # Extract from post
+    post = data.get("post", {})
+    extract_from_author(post.get("author"))
+    extract_from_submolt(post.get("submolt"))
 
-    # Track activity
-    if source_type == "post" and source_id not in agents[agent_name]["post_ids"]:
-        agents[agent_name]["post_ids"].append(source_id)
-    elif source_type == "comment" and source_id not in agents[agent_name]["comment_ids"]:
-        agents[agent_name]["comment_ids"].append(source_id)
+    # Extract from comments
+    extract_from_comments(data.get("comments", []))
 
+    # Extract from agent profile
+    agent = data.get("agent", {})
+    if agent:
+        name = agent.get("name")
+        if name:
+            state.agent_names_discovered.add(name)
 
-def extract_agents_from_comments(comments: list[dict], agents: dict):
-    """Recursively extract agents from comments and their replies."""
-    for comment in comments:
-        comment_id = comment.get("id")
-        extract_agent_from_author(comment.get("author"), agents, "comment", comment_id)
-
-        # Process nested replies
-        replies = comment.get("replies", [])
-        if replies:
-            extract_agents_from_comments(replies, agents)
+    # Extract from submolt
+    submolt = data.get("submolt", {})
+    extract_from_submolt(submolt)
 
 
 async def fetch_all_post_ids(client: AsyncMoltbookClient) -> list[dict]:
@@ -171,7 +164,6 @@ async def fetch_all_post_ids(client: AsyncMoltbookClient) -> list[dict]:
     console.print("[bold blue]Fetching post list from feed...[/bold blue]")
 
     while True:
-        # Use sort=new to get chronological order
         data = await client.get("/posts", params={"sort": "new", "offset": offset, "limit": 100})
 
         if not data or not data.get("success"):
@@ -189,7 +181,7 @@ async def fetch_all_post_ids(client: AsyncMoltbookClient) -> list[dict]:
             break
 
         offset = data.get("next_offset", offset + len(posts))
-        await asyncio.sleep(0.1)  # Small delay between pages
+        await asyncio.sleep(0.1)
 
     console.print(f"\n[green]Found {len(all_posts)} total posts[/green]")
 
@@ -199,25 +191,23 @@ async def fetch_all_post_ids(client: AsyncMoltbookClient) -> list[dict]:
 
 
 async def fetch_post_with_comments(client: AsyncMoltbookClient, post_id: str) -> dict | None:
-    """Fetch a single post with its comments."""
+    """Fetch a single post with its comments - returns RAW API response."""
     data = await client.get(f"/posts/{post_id}")
     if not data or not data.get("success"):
         return None
 
-    result = {
-        "post": data.get("post", {}),
-        "comments": data.get("comments", []),
-        "_downloaded_at": datetime.now(timezone.utc).isoformat(),
-    }
-    return result
+    # Add metadata but preserve ALL original fields
+    data["_downloaded_at"] = datetime.now(timezone.utc).isoformat()
+    data["_endpoint"] = f"/posts/{post_id}"
+    return data
 
 
-async def fetch_all_submolts(client: AsyncMoltbookClient) -> list[dict]:
-    """Fetch all submolts (communities)."""
+async def fetch_submolt_list(client: AsyncMoltbookClient) -> list[dict]:
+    """Fetch submolt list to discover all submolt names."""
     all_submolts = []
     offset = 0
 
-    console.print("[bold blue]Fetching submolts...[/bold blue]")
+    console.print("[bold blue]Fetching submolt list...[/bold blue]")
 
     while True:
         data = await client.get("/submolts", params={"offset": offset, "limit": 100})
@@ -237,8 +227,30 @@ async def fetch_all_submolts(client: AsyncMoltbookClient) -> list[dict]:
         offset = data.get("next_offset", offset + len(submolts))
         await asyncio.sleep(0.1)
 
-    console.print(f"[green]Fetched {len(all_submolts)} submolts[/green]")
+    console.print(f"[green]Found {len(all_submolts)} submolts[/green]")
     return all_submolts
+
+
+async def fetch_submolt_details(client: AsyncMoltbookClient, name: str) -> dict | None:
+    """Fetch full submolt details - returns RAW API response."""
+    data = await client.get(f"/submolts/{name}")
+    if not data or not data.get("success"):
+        return None
+
+    data["_downloaded_at"] = datetime.now(timezone.utc).isoformat()
+    data["_endpoint"] = f"/submolts/{name}"
+    return data
+
+
+async def fetch_agent_profile(client: AsyncMoltbookClient, name: str) -> dict | None:
+    """Fetch full agent profile - returns RAW API response."""
+    data = await client.get("/agents/profile", params={"name": name})
+    if not data or not data.get("success"):
+        return None
+
+    data["_downloaded_at"] = datetime.now(timezone.utc).isoformat()
+    data["_endpoint"] = f"/agents/profile?name={name}"
+    return data
 
 
 async def download_all_async(data_dir: Path, resume: bool = True):
@@ -247,8 +259,10 @@ async def download_all_async(data_dir: Path, resume: bool = True):
     # Setup directories
     posts_dir = data_dir / "posts"
     submolts_dir = data_dir / "submolts"
-    posts_dir.mkdir(parents=True, exist_ok=True)
-    submolts_dir.mkdir(parents=True, exist_ok=True)
+    agents_dir = data_dir / "agents"
+
+    for d in [posts_dir, submolts_dir, agents_dir]:
+        d.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = data_dir / "checkpoint.json"
 
@@ -257,113 +271,209 @@ async def download_all_async(data_dir: Path, resume: bool = True):
 
     if resume and state.last_checkpoint:
         console.print(f"[cyan]Resuming from checkpoint: {state.last_checkpoint}[/cyan]")
-        console.print(f"  Posts with details: {len(state.posts_with_details)}")
-        console.print(f"  Agents discovered: {len(state.agents)}")
+        console.print(f"  Posts: {len(state.posts_with_details)}")
+        console.print(f"  Submolts: {len(state.submolts_fetched)}")
+        console.print(f"  Agents: {len(state.agents_fetched)}")
 
     client = AsyncMoltbookClient()
 
     try:
-        # 1. Fetch submolts if not done
-        if not state.submolts_fetched:
-            submolts = await fetch_all_submolts(client)
-            for submolt in submolts:
-                name = submolt.get("name") or submolt.get("slug")
-                if name:
-                    submolt["_downloaded_at"] = datetime.now(timezone.utc).isoformat()
-                    filepath = submolts_dir / f"{name}.json"
-                    filepath.write_text(json.dumps(submolt, indent=2, default=str))
-                    state.submolts[name] = {
-                        "name": name,
-                        "description": submolt.get("description", ""),
-                        "subscriber_count": submolt.get("subscriber_count", 0),
-                    }
-            state.submolts_fetched = True
-            state.save(checkpoint_path)
-
-        # 2. Get all post IDs from feed
+        # ============================================================
+        # PHASE 1: Get all post IDs and fetch posts with comments
+        # ============================================================
         all_posts = await fetch_all_post_ids(client)
 
-        # 3. Filter to posts we haven't fetched details for
+        # Extract agent/submolt names from feed data
+        for post in all_posts:
+            author = post.get("author")
+            if author:
+                name = author.get("name") or author.get("username")
+                if name:
+                    state.agent_names_discovered.add(name)
+            submolt = post.get("submolt")
+            if submolt:
+                name = submolt.get("name")
+                if name:
+                    state.submolt_names_discovered.add(name)
+
         posts_to_fetch = [p for p in all_posts if p.get("id") not in state.posts_with_details]
 
-        console.print(f"[bold blue]Fetching {len(posts_to_fetch)} posts with comments (parallel)...[/bold blue]")
+        if posts_to_fetch:
+            console.print(f"[bold blue]Fetching {len(posts_to_fetch)} posts with comments...[/bold blue]")
 
-        # 4. Fetch posts in parallel batches
-        completed = 0
-        failed = 0
+            completed = 0
+            failed = 0
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Downloading posts...", total=len(posts_to_fetch))
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Downloading posts...", total=len(posts_to_fetch))
 
-            # Process in batches
-            batch_size = MAX_CONCURRENT
-            for i in range(0, len(posts_to_fetch), batch_size):
-                batch = posts_to_fetch[i:i + batch_size]
+                batch_size = MAX_CONCURRENT
+                for i in range(0, len(posts_to_fetch), batch_size):
+                    batch = posts_to_fetch[i:i + batch_size]
 
-                # Create tasks for parallel fetching
-                tasks = [fetch_post_with_comments(client, p["id"]) for p in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                    tasks = [fetch_post_with_comments(client, p["id"]) for p in batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Process results
-                for post_info, result in zip(batch, results):
-                    post_id = post_info["id"]
+                    for post_info, result in zip(batch, results):
+                        post_id = post_info["id"]
 
-                    if isinstance(result, Exception):
-                        console.print(f"[red]Error fetching {post_id}: {result}[/red]")
-                        failed += 1
-                        continue
+                        if isinstance(result, Exception):
+                            console.print(f"[red]Error fetching {post_id}: {result}[/red]")
+                            failed += 1
+                            continue
 
-                    if result is None:
-                        failed += 1
-                        continue
+                        if result is None:
+                            failed += 1
+                            continue
 
-                    # Save post with comments
-                    filepath = posts_dir / f"{post_id}.json"
-                    filepath.write_text(json.dumps(result, indent=2, default=str))
+                        # Save RAW response
+                        filepath = posts_dir / f"{post_id}.json"
+                        filepath.write_text(json.dumps(result, indent=2, default=str))
 
-                    # Extract agent info
-                    post_data = result.get("post", {})
-                    extract_agent_from_author(post_data.get("author"), state.agents, "post", post_id)
+                        # Extract names for later fetching
+                        extract_names_from_response(result, state)
 
-                    comments = result.get("comments", [])
-                    extract_agents_from_comments(comments, state.agents)
+                        state.posts_with_details.add(post_id)
+                        completed += 1
 
-                    state.posts_with_details.add(post_id)
-                    completed += 1
+                    progress.update(task, advance=len(batch), description=f"Posts: {completed} done, {failed} failed")
 
-                progress.update(task, advance=len(batch), description=f"Posts: {completed} done, {failed} failed")
+                    if completed % 100 == 0:
+                        state.save(checkpoint_path)
 
-                # Checkpoint every 100 posts
-                if completed % 100 == 0:
-                    state.save(checkpoint_path)
+                    await asyncio.sleep(BATCH_DELAY)
 
-                # Rate limit delay between batches
-                await asyncio.sleep(BATCH_DELAY)
+            state.save(checkpoint_path)
+            console.print(f"[green]Posts complete: {completed} downloaded, {failed} failed[/green]")
 
-        # Final checkpoint
-        state.save(checkpoint_path)
+        # ============================================================
+        # PHASE 2: Fetch all submolt details
+        # ============================================================
+        # First get submolt list to discover all names
+        submolt_list = await fetch_submolt_list(client)
+        for s in submolt_list:
+            name = s.get("name") or s.get("slug")
+            if name:
+                state.submolt_names_discovered.add(name)
 
-        # Save agent index
-        agents_path = data_dir / "agents_index.json"
-        agents_path.write_text(json.dumps(state.agents, indent=2, default=str))
+        submolts_to_fetch = [n for n in state.submolt_names_discovered if n not in state.submolts_fetched]
 
-        # Save submolts index
-        submolts_path = data_dir / "submolts_index.json"
-        submolts_path.write_text(json.dumps(state.submolts, indent=2, default=str))
+        if submolts_to_fetch:
+            console.print(f"[bold blue]Fetching {len(submolts_to_fetch)} submolt details...[/bold blue]")
 
-        # Final stats
+            completed = 0
+            failed = 0
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Downloading submolts...", total=len(submolts_to_fetch))
+
+                batch_size = MAX_CONCURRENT
+                for i in range(0, len(submolts_to_fetch), batch_size):
+                    batch = submolts_to_fetch[i:i + batch_size]
+
+                    tasks = [fetch_submolt_details(client, name) for name in batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for name, result in zip(batch, results):
+                        if isinstance(result, Exception):
+                            failed += 1
+                            continue
+
+                        if result is None:
+                            failed += 1
+                            continue
+
+                        # Save RAW response
+                        filepath = submolts_dir / f"{name}.json"
+                        filepath.write_text(json.dumps(result, indent=2, default=str))
+
+                        extract_names_from_response(result, state)
+                        state.submolts_fetched.add(name)
+                        completed += 1
+
+                    progress.update(task, advance=len(batch), description=f"Submolts: {completed} done, {failed} failed")
+                    await asyncio.sleep(BATCH_DELAY)
+
+            state.save(checkpoint_path)
+            console.print(f"[green]Submolts complete: {completed} downloaded, {failed} failed[/green]")
+
+        # ============================================================
+        # PHASE 3: Fetch all agent profiles
+        # ============================================================
+        agents_to_fetch = [n for n in state.agent_names_discovered if n not in state.agents_fetched]
+
+        if agents_to_fetch:
+            console.print(f"[bold blue]Fetching {len(agents_to_fetch)} agent profiles...[/bold blue]")
+
+            completed = 0
+            failed = 0
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Downloading agents...", total=len(agents_to_fetch))
+
+                batch_size = MAX_CONCURRENT
+                for i in range(0, len(agents_to_fetch), batch_size):
+                    batch = agents_to_fetch[i:i + batch_size]
+
+                    tasks = [fetch_agent_profile(client, name) for name in batch]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    for name, result in zip(batch, results):
+                        if isinstance(result, Exception):
+                            failed += 1
+                            continue
+
+                        if result is None:
+                            failed += 1
+                            continue
+
+                        # Save RAW response
+                        # Use a safe filename (replace problematic chars)
+                        safe_name = name.replace("/", "_").replace("\\", "_")
+                        filepath = agents_dir / f"{safe_name}.json"
+                        filepath.write_text(json.dumps(result, indent=2, default=str))
+
+                        state.agents_fetched.add(name)
+                        completed += 1
+
+                    progress.update(task, advance=len(batch), description=f"Agents: {completed} done, {failed} failed")
+
+                    if completed % 100 == 0:
+                        state.save(checkpoint_path)
+
+                    await asyncio.sleep(BATCH_DELAY)
+
+            state.save(checkpoint_path)
+            console.print(f"[green]Agents complete: {completed} downloaded, {failed} failed[/green]")
+
+        # ============================================================
+        # Final summary
+        # ============================================================
         console.print("\n[bold green]Download complete![/bold green]")
-        console.print(f"  Posts with comments: {len(state.posts_with_details)}")
-        console.print(f"  Failed: {failed}")
-        console.print(f"  Unique agents found: {len(state.agents)}")
-        console.print(f"  Submolts: {len(state.submolts)}")
+        console.print(f"  Posts: {len(state.posts_with_details)}")
+        console.print(f"  Submolts: {len(state.submolts_fetched)}")
+        console.print(f"  Agents: {len(state.agents_fetched)}")
         console.print(f"  Total API requests: {client.request_count}")
 
     finally:
