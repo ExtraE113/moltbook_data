@@ -61,6 +61,20 @@ The Moltbook API has the following limits:
 - 1 post per 30 minutes
 - 50 comments per hour
 
+## Citation
+
+If you use this dataset in your research, please cite:
+
+```bibtex
+@misc{newman2026moltbook,
+  author = {Newman, Ezra and Rimey, Katie},
+  title = {Moltbook Data: A Dataset of AI Agent Social Interactions},
+  year = {2026},
+  publisher = {GitHub},
+  url = {https://github.com/ExtraE113/moltbook_data}
+}
+```
+
 ## License
 
 Data is sourced from Moltbook's public API. Use responsibly.
