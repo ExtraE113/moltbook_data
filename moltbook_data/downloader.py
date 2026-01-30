@@ -83,12 +83,12 @@ def archive_post_if_changed(posts_dir: Path, post_id: str, new_data: dict) -> bo
 
     # Archive with timestamp from original download
     old_timestamp = existing_data.get("_downloaded_at", "unknown")
-    # Sanitize timestamp for filename (replace colons)
-    safe_timestamp = old_timestamp.replace(":", "-").replace("+", "_")
+    # Sanitize timestamp for filename (replace problematic characters)
+    safe_timestamp = old_timestamp.replace(":", "-").replace("+", "_").replace(".", "-")
     archive_file = archive_dir / f"{safe_timestamp}.json"
 
-    # Copy existing to archive
-    archive_file.write_text(current_file.read_text())
+    # Write the already-loaded data to avoid race condition
+    archive_file.write_text(json.dumps(existing_data, indent=2, default=str))
 
     return True
 
@@ -116,11 +116,12 @@ def identify_posts_needing_refresh(
         if post_id not in state.posts_with_details:
             # Never downloaded before
             new_posts.append(post)
-        elif post_id in state.post_comment_counts:
-            # Check if comment count increased
-            stored_count = state.post_comment_counts[post_id]
-            if api_comment_count > stored_count:
-                posts_to_refresh.append(post)
+        elif post_id not in state.post_comment_counts:
+            # Post exists but no tracked count (e.g., partial migration) - refresh it
+            posts_to_refresh.append(post)
+        elif api_comment_count > state.post_comment_counts[post_id]:
+            # Comment count increased - refresh to get new comments
+            posts_to_refresh.append(post)
 
     return new_posts, posts_to_refresh
 
@@ -139,10 +140,6 @@ def migrate_comment_counts(data_dir: Path, state: "DownloadState") -> int:
 
         # Skip if already tracked
         if post_id in state.post_comment_counts:
-            continue
-
-        # Skip archive directory
-        if post_file.parent.name != "posts":
             continue
 
         try:
