@@ -14,6 +14,7 @@ Uses async parallel fetching with rate limiting.
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -31,7 +32,17 @@ DATA_DIR = Path("data")
 MAX_CONCURRENT = 10  # Concurrent requests
 BATCH_DELAY = 0.5    # Delay between batches to respect rate limits
 
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2.0  # Exponential backoff: 2s, 4s, 8s
+
 console = Console()
+
+
+def sanitize_filename(name: str) -> str:
+    """Sanitize a string for use as a filename across all platforms."""
+    # Replace characters problematic on Windows/Unix: < > : " / \ | ? *
+    return re.sub(r'[<>:"/\\|?*]', '_', name)
 
 
 @dataclass
@@ -80,7 +91,7 @@ class DownloadState:
 
 
 class AsyncMoltbookClient:
-    """Async HTTP client for Moltbook API with rate limiting."""
+    """Async HTTP client for Moltbook API with retry logic."""
 
     def __init__(self):
         self.client = httpx.AsyncClient(
@@ -90,27 +101,60 @@ class AsyncMoltbookClient:
             limits=httpx.Limits(max_connections=MAX_CONCURRENT, max_keepalive_connections=MAX_CONCURRENT)
         )
         self.request_count = 0
-        self._lock = asyncio.Lock()
+        self.not_found_count = 0  # Track 404/405 separately
 
     async def get(self, endpoint: str, params: dict | None = None) -> dict | None:
-        """Make a GET request with error handling."""
-        async with self._lock:
+        """Make a GET request with retry logic for transient failures."""
+        last_error = None
+
+        for attempt in range(MAX_RETRIES + 1):
             self.request_count += 1
 
-        try:
-            response = await self.client.get(endpoint, params=params)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code not in (404, 405):  # Don't spam common errors
-                console.print(f"[red]HTTP {e.response.status_code}: {endpoint}[/red]")
-            return None
-        except httpx.RequestError as e:
-            console.print(f"[red]Request error: {e}[/red]")
-            return None
-        except json.JSONDecodeError:
-            console.print(f"[red]Invalid JSON: {endpoint}[/red]")
-            return None
+            try:
+                response = await self.client.get(endpoint, params=params)
+                response.raise_for_status()
+                return response.json()
+
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+
+                # 404/405 are not retryable - resource doesn't exist
+                if status in (404, 405):
+                    self.not_found_count += 1
+                    return None
+
+                # 5xx errors are retryable
+                if status >= 500 and attempt < MAX_RETRIES:
+                    delay = RETRY_BACKOFF_BASE ** attempt
+                    console.print(f"[yellow]HTTP {status} on {endpoint}, retrying in {delay}s...[/yellow]")
+                    await asyncio.sleep(delay)
+                    last_error = e
+                    continue
+
+                # 4xx (except 404/405) are not retryable
+                console.print(f"[red]HTTP {status}: {endpoint}[/red]")
+                return None
+
+            except httpx.RequestError as e:
+                # Network errors are retryable
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_BACKOFF_BASE ** attempt
+                    console.print(f"[yellow]Network error on {endpoint}, retrying in {delay}s...[/yellow]")
+                    await asyncio.sleep(delay)
+                    last_error = e
+                    continue
+
+                console.print(f"[red]Request error after {MAX_RETRIES} retries: {e}[/red]")
+                return None
+
+            except json.JSONDecodeError:
+                console.print(f"[red]Invalid JSON: {endpoint}[/red]")
+                return None
+
+        # Exhausted retries
+        if last_error:
+            console.print(f"[red]Failed after {MAX_RETRIES} retries: {endpoint}[/red]")
+        return None
 
     async def close(self):
         await self.client.aclose()
@@ -397,8 +441,9 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                             failed += 1
                             continue
 
-                        # Save RAW response
-                        filepath = submolts_dir / f"{name}.json"
+                        # Save RAW response with sanitized filename
+                        safe_name = sanitize_filename(name)
+                        filepath = submolts_dir / f"{safe_name}.json"
                         filepath.write_text(json.dumps(result, indent=2, default=str))
 
                         extract_names_from_response(result, state)
@@ -448,9 +493,8 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                             failed += 1
                             continue
 
-                        # Save RAW response
-                        # Use a safe filename (replace problematic chars)
-                        safe_name = name.replace("/", "_").replace("\\", "_")
+                        # Save RAW response with sanitized filename
+                        safe_name = sanitize_filename(name)
                         filepath = agents_dir / f"{safe_name}.json"
                         filepath.write_text(json.dumps(result, indent=2, default=str))
 
@@ -475,6 +519,8 @@ async def download_all_async(data_dir: Path, resume: bool = True):
         console.print(f"  Submolts: {len(state.submolts_fetched)}")
         console.print(f"  Agents: {len(state.agents_fetched)}")
         console.print(f"  Total API requests: {client.request_count}")
+        if client.not_found_count > 0:
+            console.print(f"  Not found (404/405): {client.not_found_count}")
 
     finally:
         await client.close()
