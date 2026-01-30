@@ -45,6 +45,114 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', name)
 
 
+def archive_post_if_changed(posts_dir: Path, post_id: str, new_data: dict) -> bool:
+    """
+    Archive existing post if content has changed.
+    Returns True if the post was archived (i.e., content changed).
+    """
+    current_file = posts_dir / f"{post_id}.json"
+
+    if not current_file.exists():
+        return False  # No existing file to archive
+
+    try:
+        existing_data = json.loads(current_file.read_text())
+    except (json.JSONDecodeError, OSError):
+        return False  # Corrupted file, just overwrite
+
+    # Compare comment counts (primary change indicator)
+    old_count = len(existing_data.get("comments", []))
+    new_count = len(new_data.get("comments", []))
+
+    # Also check post content changes (edits, votes, etc.)
+    old_post = existing_data.get("post", {})
+    new_post = new_data.get("post", {})
+
+    content_changed = (
+        old_count != new_count or
+        old_post.get("content") != new_post.get("content") or
+        old_post.get("title") != new_post.get("title")
+    )
+
+    if not content_changed:
+        return False
+
+    # Create archive directory
+    archive_dir = posts_dir / "archive" / post_id
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    # Archive with timestamp from original download
+    old_timestamp = existing_data.get("_downloaded_at", "unknown")
+    # Sanitize timestamp for filename (replace problematic characters)
+    safe_timestamp = old_timestamp.replace(":", "-").replace("+", "_").replace(".", "-")
+    archive_file = archive_dir / f"{safe_timestamp}.json"
+
+    # Write the already-loaded data to avoid race condition
+    archive_file.write_text(json.dumps(existing_data, indent=2, default=str))
+
+    return True
+
+
+def identify_posts_needing_refresh(
+    all_posts: list[dict],
+    state: "DownloadState"
+) -> tuple[list[dict], list[dict]]:
+    """
+    Categorize posts into new posts and posts needing refresh.
+
+    Returns:
+        (new_posts, posts_to_refresh)
+    """
+    new_posts = []
+    posts_to_refresh = []
+
+    for post in all_posts:
+        post_id = post.get("id")
+        if not post_id:
+            continue
+
+        api_comment_count = post.get("comment_count", 0)
+
+        if post_id not in state.posts_with_details:
+            # Never downloaded before
+            new_posts.append(post)
+        elif post_id not in state.post_comment_counts:
+            # Post exists but no tracked count (e.g., partial migration) - refresh it
+            posts_to_refresh.append(post)
+        elif api_comment_count > state.post_comment_counts[post_id]:
+            # Comment count increased - refresh to get new comments
+            posts_to_refresh.append(post)
+
+    return new_posts, posts_to_refresh
+
+
+def migrate_comment_counts(data_dir: Path, state: "DownloadState") -> int:
+    """
+    Backfill post_comment_counts from existing post files.
+    Call this once for repos with existing data.
+    Returns number of posts migrated.
+    """
+    posts_dir = data_dir / "posts"
+    migrated = 0
+
+    for post_file in posts_dir.glob("*.json"):
+        post_id = post_file.stem
+
+        # Skip if already tracked
+        if post_id in state.post_comment_counts:
+            continue
+
+        try:
+            data = json.loads(post_file.read_text())
+            comment_count = data.get("post", {}).get("comment_count", 0)
+            state.post_comment_counts[post_id] = comment_count
+            migrated += 1
+        except (json.JSONDecodeError, OSError):
+            continue
+
+    return migrated
+
+
 @dataclass
 class DownloadState:
     """Tracks download progress for checkpointing."""
@@ -54,6 +162,8 @@ class DownloadState:
     agent_names_discovered: set[str] = field(default_factory=set)
     submolt_names_discovered: set[str] = field(default_factory=set)
     last_checkpoint: str = ""
+    # Track comment counts to detect posts needing refresh
+    post_comment_counts: dict[str, int] = field(default_factory=dict)
 
     def save(self, path: Path):
         """Save checkpoint to disk."""
@@ -64,6 +174,7 @@ class DownloadState:
             "agent_names_discovered": list(self.agent_names_discovered),
             "submolt_names_discovered": list(self.submolt_names_discovered),
             "last_checkpoint": datetime.now(timezone.utc).isoformat(),
+            "post_comment_counts": self.post_comment_counts,
         }
         # Write atomically
         tmp_path = path.with_suffix(".tmp")
@@ -84,6 +195,7 @@ class DownloadState:
             state.agent_names_discovered = set(data.get("agent_names_discovered", []))
             state.submolt_names_discovered = set(data.get("submolt_names_discovered", []))
             state.last_checkpoint = data.get("last_checkpoint", "")
+            state.post_comment_counts = data.get("post_comment_counts", {})
             return state
         except (json.JSONDecodeError, KeyError) as e:
             console.print(f"[yellow]Warning: Could not load checkpoint: {e}[/yellow]")
@@ -304,8 +416,9 @@ async def download_all_async(data_dir: Path, resume: bool = True):
     posts_dir = data_dir / "posts"
     submolts_dir = data_dir / "submolts"
     agents_dir = data_dir / "agents"
+    archive_dir = posts_dir / "archive"
 
-    for d in [posts_dir, submolts_dir, agents_dir]:
+    for d in [posts_dir, submolts_dir, agents_dir, archive_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
     checkpoint_path = data_dir / "checkpoint.json"
@@ -313,9 +426,17 @@ async def download_all_async(data_dir: Path, resume: bool = True):
     # Load checkpoint
     state = DownloadState.load(checkpoint_path) if resume else DownloadState()
 
+    # Migrate existing data if needed (backfill comment counts)
+    if state.posts_with_details and not state.post_comment_counts:
+        console.print("[cyan]Migrating existing posts to comment tracking...[/cyan]")
+        migrated = migrate_comment_counts(data_dir, state)
+        console.print(f"[green]Migrated {migrated} posts[/green]")
+        state.save(checkpoint_path)
+
     if resume and state.last_checkpoint:
         console.print(f"[cyan]Resuming from checkpoint: {state.last_checkpoint}[/cyan]")
         console.print(f"  Posts: {len(state.posts_with_details)}")
+        console.print(f"  Posts with tracked counts: {len(state.post_comment_counts)}")
         console.print(f"  Submolts: {len(state.submolts_fetched)}")
         console.print(f"  Agents: {len(state.agents_fetched)}")
 
@@ -340,13 +461,22 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                 if name:
                     state.submolt_names_discovered.add(name)
 
-        posts_to_fetch = [p for p in all_posts if p.get("id") not in state.posts_with_details]
+        # Categorize posts: new vs needing refresh (comment count increased)
+        new_posts, posts_to_refresh = identify_posts_needing_refresh(all_posts, state)
+        all_posts_to_fetch = new_posts + posts_to_refresh
+        refresh_ids = {p["id"] for p in posts_to_refresh}
 
-        if posts_to_fetch:
-            console.print(f"[bold blue]Fetching {len(posts_to_fetch)} posts with comments...[/bold blue]")
+        if new_posts:
+            console.print(f"[blue]New posts to download: {len(new_posts)}[/blue]")
+        if posts_to_refresh:
+            console.print(f"[blue]Posts to refresh (new comments): {len(posts_to_refresh)}[/blue]")
+
+        if all_posts_to_fetch:
+            console.print(f"[bold blue]Fetching {len(all_posts_to_fetch)} posts with comments...[/bold blue]")
 
             completed = 0
             failed = 0
+            archived = 0
 
             with Progress(
                 SpinnerColumn(),
@@ -356,11 +486,11 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                 TimeElapsedColumn(),
                 console=console,
             ) as progress:
-                task = progress.add_task("Downloading posts...", total=len(posts_to_fetch))
+                task = progress.add_task("Downloading posts...", total=len(all_posts_to_fetch))
 
                 batch_size = MAX_CONCURRENT
-                for i in range(0, len(posts_to_fetch), batch_size):
-                    batch = posts_to_fetch[i:i + batch_size]
+                for i in range(0, len(all_posts_to_fetch), batch_size):
+                    batch = all_posts_to_fetch[i:i + batch_size]
 
                     tasks = [fetch_post_with_comments(client, p["id"]) for p in batch]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -377,17 +507,25 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                             failed += 1
                             continue
 
-                        # Save RAW response
+                        # Archive if this is a refresh and content changed
+                        if post_id in refresh_ids:
+                            if archive_post_if_changed(posts_dir, post_id, result):
+                                archived += 1
+
+                        # Save RAW response (current version)
                         filepath = posts_dir / f"{post_id}.json"
                         filepath.write_text(json.dumps(result, indent=2, default=str))
 
                         # Extract names for later fetching
                         extract_names_from_response(result, state)
 
+                        # Update tracking
                         state.posts_with_details.add(post_id)
+                        comment_count = result.get("post", {}).get("comment_count", 0)
+                        state.post_comment_counts[post_id] = comment_count
                         completed += 1
 
-                    progress.update(task, advance=len(batch), description=f"Posts: {completed} done, {failed} failed")
+                    progress.update(task, advance=len(batch), description=f"Posts: {completed} done, {archived} archived, {failed} failed")
 
                     if completed % 100 == 0:
                         state.save(checkpoint_path)
@@ -395,7 +533,7 @@ async def download_all_async(data_dir: Path, resume: bool = True):
                     await asyncio.sleep(BATCH_DELAY)
 
             state.save(checkpoint_path)
-            console.print(f"[green]Posts complete: {completed} downloaded, {failed} failed[/green]")
+            console.print(f"[green]Posts complete: {completed} downloaded, {archived} archived, {failed} failed[/green]")
 
         # ============================================================
         # PHASE 2: Fetch all submolt details
