@@ -409,6 +409,86 @@ async def fetch_agent_profile(client: AsyncMoltbookClient, name: str) -> dict | 
     return data
 
 
+def generate_submolts_index(submolts_dir: Path):
+    """
+    Generate an index.json file listing all submolts with basic metadata.
+
+    This allows browsing the full list even when directory listing is truncated
+    (GitHub truncates at 1000 entries).
+    """
+    index_entries = []
+
+    for filepath in sorted(submolts_dir.glob("*.json")):
+        if filepath.name == "index.json":
+            continue
+
+        try:
+            data = json.loads(filepath.read_text())
+            submolt = data.get("submolt", {})
+
+            index_entries.append({
+                "name": submolt.get("name", filepath.stem),
+                "display_name": submolt.get("display_name"),
+                "subscriber_count": submolt.get("subscriber_count", 0),
+                "file": filepath.name,
+            })
+        except (json.JSONDecodeError, OSError):
+            # Include files we couldn't parse with minimal info
+            index_entries.append({
+                "name": filepath.stem,
+                "file": filepath.name,
+            })
+
+    index_path = submolts_dir / "index.json"
+    index_data = {
+        "count": len(index_entries),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "submolts": index_entries,
+    }
+    index_path.write_text(json.dumps(index_data, indent=2))
+    console.print(f"[green]Generated submolts index with {len(index_entries)} entries[/green]")
+
+
+def generate_agents_index(agents_dir: Path):
+    """
+    Generate an index.json file listing all agents with basic metadata.
+
+    This allows browsing the full list even when directory listing is truncated
+    (GitHub truncates at 1000 entries).
+    """
+    index_entries = []
+
+    for filepath in sorted(agents_dir.glob("*.json")):
+        if filepath.name == "index.json":
+            continue
+
+        try:
+            data = json.loads(filepath.read_text())
+            agent = data.get("agent", {})
+
+            index_entries.append({
+                "name": agent.get("name", filepath.stem),
+                "karma": agent.get("karma", 0),
+                "follower_count": agent.get("follower_count", 0),
+                "file": filepath.name,
+            })
+        except (json.JSONDecodeError, OSError):
+            # Include files we couldn't parse with minimal info
+            index_entries.append({
+                "name": filepath.stem,
+                "file": filepath.name,
+            })
+
+    index_path = agents_dir / "index.json"
+    index_data = {
+        "count": len(index_entries),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "agents": index_entries,
+    }
+    index_path.write_text(json.dumps(index_data, indent=2))
+    console.print(f"[green]Generated agents index with {len(index_entries)} entries[/green]")
+
+
 async def download_all_async(data_dir: Path, resume: bool = True):
     """Main async download function."""
 
@@ -594,6 +674,9 @@ async def download_all_async(data_dir: Path, resume: bool = True):
             state.save(checkpoint_path)
             console.print(f"[green]Submolts complete: {completed} downloaded, {failed} failed[/green]")
 
+        # Generate submolts index for browsing (directory listing gets truncated at 1000 entries)
+        generate_submolts_index(submolts_dir)
+
         # ============================================================
         # PHASE 3: Fetch all agent profiles
         # ============================================================
@@ -648,6 +731,9 @@ async def download_all_async(data_dir: Path, resume: bool = True):
 
             state.save(checkpoint_path)
             console.print(f"[green]Agents complete: {completed} downloaded, {failed} failed[/green]")
+
+        # Generate agents index for browsing (directory listing gets truncated at 1000 entries)
+        generate_agents_index(agents_dir)
 
         # ============================================================
         # Final summary
