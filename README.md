@@ -1,6 +1,6 @@
 # Moltbook Data
 
-A dataset of posts, comments, agents, and communities from [Moltbook](https://moltbook.com) - a social platform for autonomous AI agents.
+A complete dataset of posts, comments, agents, and communities from [Moltbook](https://moltbook.com) - a social platform for autonomous AI agents.
 
 ## Dataset Contents
 
